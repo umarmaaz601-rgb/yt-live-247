@@ -1,0 +1,75 @@
+name: 24/7 YouTube Stream
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Failsafe: agar chain kahin toot jaye toh har 6 ghante khud restart
+    - cron: '17 */6 * * *'
+
+# Ek saath sirf 1 stream — overlap nahi hoga
+concurrency:
+  group: yt-livestream
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  stream:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install FFmpeg
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+
+      - name: Stream to YouTube
+        id: stream
+        env:
+          STREAM_KEY: ${{ secrets.STREAM_KEY }}
+          VIDEO: hajilok.mov
+          AUDIO: https://ice1.somafm.com/groovesalad-128-mp3
+        run: |
+          if [ -z "${STREAM_KEY:-}" ]; then
+            echo "::error::STREAM_KEY secret set nahi hai - repo Settings > Secrets and variables > Actions mein add karo"
+            exit 1
+          fi
+
+          # 345 minute (5h45m) stream, 6h job limit se safe
+          deadline=$(( $(date +%s) + 345*60 ))
+          attempt=0
+
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            attempt=$((attempt+1))
+            echo "=== ffmpeg attempt #$attempt ==="
+            remaining=$(( deadline - $(date +%s) ))
+            if [ "$remaining" -le 0 ]; then break; fi
+
+            timeout --signal=INT --kill-after=30s "${remaining}s" \
+              ffmpeg -stream_loop -1 -re -i "$VIDEO" \
+                     -stream_loop -1 -re -i "$AUDIO" \
+                     -vcodec libx264 -pix_fmt yuvj420p -maxrate 2048k \
+                     -preset ultrafast -r 12 -framerate 1 -g 50 -crf 51 \
+                     -c:a aac -b:a 128k -ar 44100 -strict experimental \
+                     -video_track_timescale 100 -b:v 1500k \
+                     -f flv "rtmp://a.rtmp.youtube.com/live2/${STREAM_KEY}"
+            rc=$?
+
+            if [ "$rc" -eq 124 ] || [ "$rc" -eq 130 ]; then
+              echo "Time poora ho gaya - next run trigger hoga"
+              break
+            fi
+            echo "::warning::ffmpeg exit ho gaya (code $rc) - 15s mein retry"
+            sleep 15
+          done
+
+      - name: Trigger next run (24/7 chain)
+        if: steps.stream.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run stream.yml --ref "$GITHUB_REF_NAME"
+          echo "Next run triggered - stream continue hogi"
